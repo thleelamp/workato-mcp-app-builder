@@ -1,0 +1,178 @@
+<!-- If needed, copy the code and paste it into AI tools like Claude, Cursor, or ChatGPT. -->
+<!-- Ask them to update it directly. Example: "Replace approval with timesheet." -->
+<!-- WRITE + REFRESH variant: result-viewer with action buttons (POST then GET). -->
+<!-- Requires two tools on the server: -->
+<!--   list_pending_approvals  (GET, the linked tool)                         -->
+<!--   set_approval_status     (WRITE, register as app-only: visibility ["app"]) -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Approval Queue</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  </head>
+  <body class="min-h-screen bg-slate-50 text-slate-800 antialiased">
+    <div class="mx-auto w-full max-w-5xl px-4 py-10">
+      <div class="rounded-2xl border border-blue-500 bg-white p-8 shadow-sm sm:p-10">
+        <header class="mb-6 flex items-center justify-between gap-4">
+          <div>
+            <h1 class="text-3xl font-bold tracking-tight text-slate-900">Approval Queue</h1>
+            <p class="mt-2 text-base text-slate-500">Review each request and approve or reject it. The list refreshes after every action.</p>
+          </div>
+          <button id="refresh"
+            class="shrink-0 rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-60">Refresh</button>
+        </header>
+
+        <div id="error-banner" class="mb-4 hidden rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700"></div>
+        <div id="summary" class="mb-4 flex flex-wrap gap-2"></div>
+
+        <div class="overflow-x-auto rounded-xl border border-slate-200">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th class="px-4 py-3">Request</th>
+                <th class="px-4 py-3">Requester</th>
+                <th class="px-4 py-3">Amount</th>
+                <th class="px-4 py-3">Status</th>
+                <th class="px-4 py-3 text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody id="results-body" class="divide-y divide-slate-100"></tbody>
+          </table>
+        </div>
+        <p id="empty-state" class="hidden py-8 text-center text-sm text-slate-400">Nothing pending. You are all caught up.</p>
+      </div>
+
+      <details id="raw-wrap" class="mt-4 hidden rounded-lg border border-slate-200 bg-white p-4 text-sm">
+        <summary class="cursor-pointer font-medium text-slate-600">Raw response</summary>
+        <pre id="raw" class="mt-2 overflow-x-auto whitespace-pre-wrap text-xs text-slate-500"></pre>
+      </details>
+    </div>
+
+    <script type="module">
+      // Most cases, do not modify this import line (Workato MCP Apps SDK bundle).
+      import {App} from 'https://cdn.jsdelivr.net/npm/@modelcontextprotocol/ext-apps@1.3.1/dist/src/app-with-deps.js';
+
+      (async () => {
+        const app = new App({name: 'Approval Queue', version: '1.0.0'});
+        const bodyEl = document.getElementById('results-body');
+        const summaryEl = document.getElementById('summary');
+        const errorBanner = document.getElementById('error-banner');
+        const emptyState = document.getElementById('empty-state');
+        const refreshBtn = document.getElementById('refresh');
+        const rawWrap = document.getElementById('raw-wrap');
+        const rawEl = document.getElementById('raw');
+
+        function esc(v) {
+          return String(v ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+        }
+
+        function extractData(result) {
+          if (!result) return {};
+          if (result.structuredContent) return result.structuredContent;
+          const text = result.content?.find(c => c.type === 'text')?.text;
+          if (text) { try { return JSON.parse(text); } catch (e) { return {message: text}; } }
+          return {};
+        }
+
+        function showError(msg) {
+          errorBanner.textContent = msg;
+          errorBanner.classList.remove('hidden');
+        }
+
+        function statusBadge(s) {
+          const v = String(s ?? 'pending').toLowerCase();
+          const tone = v === 'approved' ? 'bg-green-100 text-green-700'
+            : v === 'rejected' ? 'bg-red-100 text-red-700'
+            : 'bg-amber-100 text-amber-700';
+          return `<span class="rounded-full px-2.5 py-1 text-xs font-medium ${tone}">${esc(v)}</span>`;
+        }
+
+        function render(data) {
+          rawEl.textContent = JSON.stringify(data, null, 2);
+          rawWrap.classList.remove('hidden');
+          errorBanner.classList.add('hidden');
+          if (data.error) showError(String(data.error));
+
+          // Find the queue: prefer `items`, else the first array of objects.
+          let rows = Array.isArray(data.items) ? data.items : [];
+          if (!rows.length) {
+            for (const v of Object.values(data)) {
+              if (Array.isArray(v) && v.some(x => x && typeof x === 'object')) { rows = v; break; }
+            }
+          }
+
+          summaryEl.innerHTML = Object.entries(data)
+            .filter(([k, v]) => v != null && ['string', 'number', 'boolean'].includes(typeof v) && k !== 'error')
+            .map(([k, v]) => `<span class="rounded-full bg-slate-200 px-3 py-1 text-xs font-medium text-slate-600">${esc(k.replace(/_/g, ' '))}: ${esc(v)}</span>`)
+            .join('');
+
+          if (!rows.length) {
+            bodyEl.innerHTML = '';
+            emptyState.classList.remove('hidden');
+            return;
+          }
+          emptyState.classList.add('hidden');
+
+          bodyEl.innerHTML = rows.map(r => {
+            const id = esc(r.id);
+            const done = ['approved', 'rejected'].includes(String(r.status ?? '').toLowerCase());
+            return `
+            <tr class="hover:bg-slate-50">
+              <td class="px-4 py-3 font-medium text-slate-800">${esc(r.title ?? r.name ?? r.id)}</td>
+              <td class="px-4 py-3 text-slate-600">${esc(r.requester ?? '')}</td>
+              <td class="px-4 py-3 text-slate-600">${esc(r.amount ?? '')}</td>
+              <td class="px-4 py-3">${statusBadge(r.status)}</td>
+              <td class="px-4 py-3 text-right">
+                ${done ? '' : `
+                  <button data-id="${id}" data-action="approve"
+                    class="rounded-md bg-green-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-green-500 disabled:opacity-50">Approve</button>
+                  <button data-id="${id}" data-action="reject"
+                    class="ml-1 rounded-md bg-red-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-red-500 disabled:opacity-50">Reject</button>`}
+              </td>
+            </tr>`;
+          }).join('');
+        }
+
+        // GET: re-fetch the queue and re-render.
+        async function refresh() {
+          refreshBtn.disabled = true;
+          try {
+            const result = await app.callServerTool({ name: 'list_pending_approvals', arguments: {} });
+            render(extractData(result));
+          } catch (err) {
+            showError('Failed to load queue: ' + (err?.message ?? err));
+          } finally {
+            refreshBtn.disabled = false;
+          }
+        }
+
+        // POST then GET: write the new status with the app-only tool, then refresh.
+        async function act(id, status, buttons) {
+          buttons.forEach(b => (b.disabled = true));
+          try {
+            await app.callServerTool({ name: 'set_approval_status', arguments: { id, status } });
+            await refresh();
+          } catch (err) {
+            showError('Action failed: ' + (err?.message ?? err));
+            buttons.forEach(b => (b.disabled = false));
+          }
+        }
+
+        bodyEl.addEventListener('click', event => {
+          const btn = event.target.closest('button[data-action]');
+          if (!btn) return;
+          const status = btn.dataset.action === 'approve' ? 'approved' : 'rejected';
+          const rowButtons = [...btn.parentElement.querySelectorAll('button')];
+          act(btn.dataset.id, status, rowButtons);
+        });
+
+        refreshBtn.addEventListener('click', refresh);
+
+        // RESULT-VIEWER: render the queue the model already fetched when the App opened.
+        app.ontoolresult = (result) => render(extractData(result));
+        await app.connect();
+      })();
+    </script>
+  </body>
+</html>
